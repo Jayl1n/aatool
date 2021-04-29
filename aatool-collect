@@ -1,0 +1,120 @@
+#!/usr/bin/env python
+
+'''
+A deduplication script
+author: Jayl1n
+'''
+
+import os
+import shutil
+import subprocess
+import sys
+import re
+import hashlib
+
+crash_dirs = []
+crash_files = []
+crash_details = {}
+
+collect_files = {}
+
+
+def usage():
+    print('usage: aatool-collect.py ./afl_sync_dir ./collect_dir -- /path/to/target @@')
+    exit(-1)
+
+
+def collect_crash(afl_sync_dir):
+    for root, dirs, files in os.walk(afl_sync_dir):
+        if root.endswith('crashes'):
+            crash_dirs.append(root)
+            for file in files:
+                crash_files.append(os.path.join(root, file))
+    print('[+] Found {} crash file{}.'.format(len(crash_files), 's' if len(crash_files) > 1 else ''))
+
+
+def execute_target(cmd_template):
+    for crash_file in crash_files:
+        cmd = cmd_template.replace('@@', crash_file)
+        # execute
+        r = subprocess.Popen(
+            cmd.split(' '), shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
+        )
+        _, error = r.communicate()
+        crash_details[crash_file] = {}
+        crash_details[crash_file]['output'] = error.decode('utf-8')
+        crash_details[crash_file]['size'] = os.path.getsize(crash_file)
+
+
+def analysis_crash(crash_details):
+    # classific
+    remove_file = []
+    for file, detail in crash_details.items():
+        crash_type = re.search(r'ERROR: AddressSanitizer: ([\w-]+)', detail['output'])
+        if not crash_type:
+            remove_file.append(file)
+            continue
+        crash_details[file]['type'] = crash_type.group(1)
+
+        md5 = hashlib.md5()
+        backtrace = re.findall(r'(?P<btid>#\d+) \S+ in (?P<func>.*)', detail['output'])
+        for btid, func in backtrace:
+            md5.update(func.encode('utf-8'))
+        crash_details[file]['sign'] = md5.hexdigest()
+
+        sign = md5.hexdigest()
+        if sign not in collect_files or collect_files[sign]['size'] > detail['size']:
+            collect_files[sign] = {}
+            collect_files[sign]['file'] = file
+            collect_files[sign]['type'] = detail['type']
+            collect_files[sign]['size'] = detail['size']
+
+    # remove invalid crash file
+    for file in remove_file:
+        crash_details.pop(file)
+
+
+def main():
+    if len(sys.argv) < 6 or sys.argv[3] != '--':
+        usage()
+
+    # check target program
+    if not os.path.exists(sys.argv[4]) or not os.path.isfile(sys.argv[4]) or not os.access(sys.argv[4], os.X_OK) \
+            or '@@' not in sys.argv[5:]:
+        usage()
+
+    # collect crashes
+    afl_sync_dir = sys.argv[1]
+    if not os.path.exists(afl_sync_dir) or not os.path.isdir(afl_sync_dir):
+        usage()
+    else:
+        collect_crash(afl_sync_dir)
+
+    collect_dir = sys.argv[2]
+    if not os.path.exists(collect_dir) or not os.path.isdir(collect_dir):
+        os.mkdir(collect_dir)
+
+    # execute target with crash files
+    execute_target(' '.join(sys.argv[4:]))
+
+    analysis_crash(crash_details)
+
+    # done.
+    crash_type_total = {}
+    for sign, file in collect_files.items():
+        shutil.copyfile(file['file'], os.path.join(collect_dir, sign + '.crash'))
+        crash_type_total[file['type']] = crash_type_total[file['type']] + 1 if file['type'] in crash_type_total else 1
+
+    print('[+] Found \033[31m{}\033[0m different crash{} saved to {}.'.format(len(collect_files),
+                                                                  'es' if len(crash_files) > 1 else '',
+                                                                                          collect_dir))
+
+    print(' |  Include: ')
+    for crash_type, total in crash_type_total.items():
+        print('    \033[31m{}\033[0m {}'.format(total, crash_type))
+
+    print('[+] Done.')
+
+
+if __name__ == '__main__':
+    main()
