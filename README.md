@@ -1,0 +1,2 @@
+# aatool
+AFL auxiliary tool
