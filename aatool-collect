@@ -11,6 +11,16 @@ import subprocess
 import sys
 import re
 import hashlib
+import threading
+
+try:
+    CPU_COUNT = os.cpu_count()
+except:
+    import psutil
+    CPU_COUNT = psutil.cpu_count()
+
+SEM = threading.Semaphore(CPU_COUNT * 2)
+LOCK = threading.Lock()
 
 crash_dirs = []
 crash_files = []
@@ -30,20 +40,44 @@ def collect_crash(afl_sync_dir):
             crash_dirs.append(root)
             for file in files:
                 crash_files.append(os.path.join(root, file))
-    print('[+] Found {} crash file{}.'.format(len(crash_files), 's' if len(crash_files) > 1 else ''))
+    print('[+] Found {} crash file{}.'.format(len(crash_files),
+          's' if len(crash_files) > 1 else ''))
+
+
+def progressbar(it, prefix="", size=60, file=sys.stdout):
+    count = len(it)
+
+    def show(j):
+        x = int(size*j/count)
+        file.write("%s[%s%s] %i/%i\r" %
+                   (prefix, "#"*x, "."*(size-x), j, count))
+        file.flush()
+    show(0)
+    for i, item in enumerate(it):
+        yield item
+        show(i+1)
+    file.write("\n")
+    file.flush()
 
 
 def execute_target(cmd_template):
-    for crash_file in crash_files:
-        cmd = cmd_template.replace('@@', crash_file)
-        # execute
+
+    def execute_target_internal(cmd, crash_file):
         r = subprocess.Popen(
             cmd.split(' '), shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
         )
         _, error = r.communicate()
+        LOCK.acquire()
         crash_details[crash_file] = {}
         crash_details[crash_file]['output'] = error.decode('utf-8')
         crash_details[crash_file]['size'] = os.path.getsize(crash_file)
+        LOCK.release()
+
+    with SEM:
+        for crash_file in progressbar(crash_files, "[*] Processing: ", 40):
+            cmd = cmd_template.replace('@@', crash_file)
+            threading.Thread(target=execute_target_internal,
+                             args=(cmd, crash_file)).start()
 
 
 def analysis_crash(crash_details):
@@ -68,6 +102,7 @@ def analysis_crash(crash_details):
             collect_files[sign]['file'] = file
             collect_files[sign]['type'] = detail['type']
             collect_files[sign]['size'] = detail['size']
+            collect_files[sign]['output'] = detail['output']
 
     # remove invalid crash file
     for file in remove_file:
@@ -103,6 +138,8 @@ def main():
     crash_type_total = {}
     for sign, file in collect_files.items():
         shutil.copyfile(file['file'], os.path.join(collect_dir, sign + '.crash'))
+        with open(os.path.join(collect_dir, sign+'.crash.output'), 'w+') as crash_output_file:
+            crash_output_file.write(file['output'])
         crash_type_total[file['type']] = crash_type_total[file['type']] + 1 if file['type'] in crash_type_total else 1
 
     print('[+] Found \033[31m{}\033[0m different crash{} saved to {}.'.format(len(collect_files),
